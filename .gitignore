@@ -1,0 +1,54 @@
+# Python cache/compiled
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.so
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.cache/
+
+# Logs
+*.log
+*.err
+*.out
+
+# IDE/Editor configs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Docker
+*.pid
+*.seed
+*.pid.lock
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# SQLite db (if you generate one locally)
+*.db
+
+# Environment variables
+.env
+.env.*

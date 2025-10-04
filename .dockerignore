@@ -1,0 +1,18 @@
+# venv / cache
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# git
+.git/
+.gitignore
+
+# OS junk
+.DS_Store
+
+# local db / artifacts
+wand.db
+*.sqlite
+.env
