@@ -1,50 +1,65 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import asyncio, uuid, time, logging, sys
 from typing import Dict, List
 
+from app.core.config import get_config, validate_startup_config
+from app.core.logging_utils import setup_logging, log_config_on_startup, get_logger
+from app.core.middleware import (
+    RequestLoggingMiddleware, 
+    RateLimitMiddleware, 
+    SecurityHeadersMiddleware,
+    auth_handler,
+    get_authenticated_user
+)
 from app.core.registry import ToolRegistry, AgentRegistry
 from app.runtime.executor import Executor, GraphSpec, NodeSpec, EdgeSpec
 from app.storage import init_db, save_run, append_event, load_events
 from contextlib import asynccontextmanager
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(name)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("wand")
-
-
 # ----------------------- Lifespan (startup/shutdown) ------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # startup
+    validate_startup_config()
+    setup_logging()
+    log_config_on_startup()
     await init_db()
     yield
 
+# Get configuration
+config = get_config()
+logger = get_logger("wand.main")
+
 app = FastAPI(
-    title="Wand Orchestrator (MVP)",
-    version="1.0.0",
+    title=config.app_name,
+    version=config.app_version,
     description=(
         "DAG-based multi-agent orchestration layer.\n\n"
         "- Concurrency / Retries / Timeouts\n"
         "- Pluggable Tools & Agents\n"
         "- SSE streaming and cancellation\n"
-        "- (Demo) Authentication disabled for Swagger"
+        "- Configuration-driven setup\n"
+        "- Authentication and rate limiting"
     ),
     contact={"name": "Maksim", "url": "https://github.com/mcnic"},
     license_info={"name": "MIT"},
-    lifespan=lifespan
+    lifespan=lifespan,
+    debug=config.debug
 )
+
+# Add middleware in correct order (last added = first executed)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=config.security.cors_origins,
+    allow_credentials=config.security.cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -104,7 +119,13 @@ class EventLog(BaseModel):
 
 @app.get("/health", tags=["systems"], summary="Health Check")
 def health():
-    return {"ok": True}
+    """Health check endpoint - no authentication required."""
+    return {
+        "ok": True, 
+        "version": config.app_version,
+        "environment": config.environment,
+        "timestamp": time.time()
+    }
 
 @app.post(
     "/graphs",
@@ -112,7 +133,8 @@ def health():
     tags=["graphs"],
     summary="Create (register) an execution graph"
 )
-def create_graph(req: CreateGraphReq):
+def create_graph(req: CreateGraphReq, user=Depends(get_authenticated_user)):
+    """Create and register a new execution graph."""
     gid = f"g_{uuid.uuid4().hex[:8]}"
     spec = GraphSpec(
         name=req.name, 
@@ -121,6 +143,7 @@ def create_graph(req: CreateGraphReq):
         options=req.options or {}
     )
     GRAPHS[gid] = spec
+    logger.info(f"Graph created: {gid} - {req.name}")
     return {"graph_id": gid}
 
 class CreateRunReq(BaseModel):
@@ -133,7 +156,8 @@ class CreateRunReq(BaseModel):
     tags=["runs"],
     summary="Start a run for a given graph",
 )
-async def create_run(req: CreateRunReq):
+async def create_run(req: CreateRunReq, user=Depends(get_authenticated_user)):
+    """Start execution of a graph."""
     if req.graph_id not in GRAPHS:
         raise HTTPException(404, "graph not found")
     rid = f"r_{uuid.uuid4().hex[:8]}"
@@ -142,39 +166,45 @@ async def create_run(req: CreateRunReq):
     logger.info(f"Run created: {rid} for graph={req.graph_id}")
     RUN_CTRLS[rid] = RunCtrl()
     await save_run(rid, GRAPHS[req.graph_id].name, "PENDING", None, None)
-    asyncio.create_task(_run_background(rid, GRAPHS[req.graph_id], EVENTS[rid], RUN_CTRLS[rid]))
+    
+    # Add run_id to emit function for logging
+    async def emit_with_run_id(evt: dict):
+        await RUN_CTRLS[rid].queue.put(evt)
+        await append_event(rid, evt)
+    emit_with_run_id._run_id = rid
+    
+    asyncio.create_task(_run_background(rid, GRAPHS[req.graph_id], EVENTS[rid], RUN_CTRLS[rid], emit_with_run_id))
     return {"run_id": rid}
 
-async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: RunCtrl):
+async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: RunCtrl, on_event_func):
     logger.info(f"Run {run_id} started")
     RUNS[run_id]["status"] = "RUNNING"
     await save_run(run_id, graph.name, "RUNNING", None, None)
-
-    async def on_event(evt: dict):
-        await ctrl.queue.put(evt)
-        await append_event(run_id, evt)
 
     try:
         result = await executor.execute(
             graph, 
             events,
             cancel_event=ctrl.cancel_event,
-            on_event=on_event
+            on_event=on_event_func
         )
         RUNS[run_id]["status"] = "SUCCESS"
         RUNS[run_id]["result"] = result
         await save_run(run_id, graph.name, "SUCCESS", result, None)
         await ctrl.queue.put({"ts": time.time(), "lvl": "info", "msg": "run.success"})
+        logger.info(f"Run {run_id} completed successfully")
     except asyncio.CancelledError:
         RUNS[run_id]["status"] = "CANCELLED"
         RUNS[run_id]["error"] = "cancelled"
         await save_run(run_id, graph.name, "CANCELLED", None, "cancelled")
         await ctrl.queue.put({"ts": time.time(), "lvl": "warn", "msg": "run.cancelled"})
+        logger.warning(f"Run {run_id} was cancelled")
     except Exception as e:
         RUNS[run_id]["status"] = "FAILED"
         RUNS[run_id]["error"] = str(e)
         await save_run(run_id, graph.name, "FAILED", None, str(e))
         await ctrl.queue.put({"ts": time.time(), "lvl": "error", "msg": f"run.failed: {e}"})
+        logger.error(f"Run {run_id} failed: {e}")
     finally:
         await ctrl.queue.put({"eof": True})
 
@@ -182,9 +212,10 @@ async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: Run
     "/runs/{run_id}",
     response_model=RunState,
     tags=["runs"],
-    summary="Get run event log",
+    summary="Get run status and result",
 )
-def get_run(run_id: str):
+def get_run(run_id: str, user=Depends(get_authenticated_user)):
+    """Get the current status and result of a run."""
     if run_id not in RUNS:
         raise HTTPException(404, "run not found")
     return RUNS[run_id]
@@ -192,26 +223,28 @@ def get_run(run_id: str):
 @app.get(
     "/runs/{run_id}/logs",
     response_model=List[EventLog],
-    tags=["run"],
-    summary="SSE stream of run events",
+    tags=["runs"],
+    summary="Get run event logs",
 )
-async def get_logs(run_id: str):
+async def get_logs(run_id: str, user=Depends(get_authenticated_user)):
+    """Get all logged events for a run."""
     if run_id not in EVENTS:
         raise HTTPException(404, "run not found")
     return await load_events(run_id)
 
-@app.get("/runs/{run_id}/stream")
-async def stream(run_id: str):
+@app.get("/runs/{run_id}/stream", tags=["runs"], summary="SSE stream of run events")
+async def stream(run_id: str, user=Depends(get_authenticated_user)):
+    """Stream run events in real-time via Server-Sent Events."""
     if run_id not in RUN_CTRLS:
         raise HTTPException(404, "run not found")
     
     async def event_gen():
         q = RUN_CTRLS[run_id].queue
-        yield f"data: { {'msg':'stream.start'} }\n\n"
+        yield f"data: {{'msg':'stream.start', 'run_id':'{run_id}'}}\n\n"
         while True:
             evt = await q.get()
             if evt.get("eof"):
-                yield f"data: { {'msg':'stream.end'} }"
+                yield f"data: {{'msg':'stream.end', 'run_id':'{run_id}'}}\n\n"
                 break
             yield f"data: {evt}\n\n"
 
@@ -219,11 +252,44 @@ async def stream(run_id: str):
 
 @app.post(
     "/runs/{run_id}/cancel",
-    tags=["run"],
+    tags=["runs"],
     summary="Cancel a running execution"
 )
-async def cancel_run(run_id: str):
+async def cancel_run(run_id: str, user=Depends(get_authenticated_user)):
+    """Cancel an active run."""
     if run_id not in RUN_CTRLS:
         raise HTTPException(404, "run not found")
     RUN_CTRLS[run_id].cancel_event.set()
-    return {"ok": True}
+    logger.info(f"Run {run_id} cancellation requested")
+    return {"ok": True, "message": f"Cancellation requested for run {run_id}"}
+
+# Configuration endpoints
+@app.get("/config", tags=["configuration"], summary="Get current configuration")
+async def get_configuration(user=Depends(get_authenticated_user)):
+    """Get current application configuration (excluding sensitive data)."""
+    config_dict = config.to_dict()
+    
+    # Remove sensitive information
+    if "security" in config_dict:
+        config_dict["security"] = {
+            k: ("***" if k in ["api_key", "jwt_secret"] else v)
+            for k, v in config_dict["security"].items()
+        }
+    
+    return {
+        "configuration": config_dict,
+        "warnings": config.validate_config(),
+        "environment": config.environment,
+        "is_production": config.is_production()
+    }
+
+@app.get("/config/validate", tags=["configuration"], summary="Validate current configuration")
+async def validate_configuration(user=Depends(get_authenticated_user)):
+    """Validate current configuration and return any issues."""
+    warnings = config.validate_config()
+    
+    return {
+        "valid": len(warnings) == 0,
+        "warnings": warnings,
+        "environment": config.environment
+    }
