@@ -7,38 +7,42 @@ from app.core.registry import ToolRegistry, AgentRegistry
 from app.core.interfaces import _validate_keys as _check_keys
 from app.core.config import get_config
 from app.core.logging_utils import get_logger, log_agent_execution, log_performance
+from app.core.exceptions import ExecutionError, TimeoutError, ValidationError
+from app.core.error_handlers import convert_exceptions, raise_execution_error
 
 EventSink = Callable[[dict], Awaitable[None]]
 
 def _validate_graph(graph: GraphSpec) -> None:
-    node_ids = {n.id for n in graph.nodes}
-    if len(node_ids) != len(graph.nodes):
-        raise ValueError("Duplicate node.id detected")
-    
-    for e in graph.edges:
-        if e.from_ not in node_ids:
-            raise ValueError(f"Edge.from references unknown node: {e.from_}")
-        if e.to not in node_ids:
-            raise ValueError(f"Edge.to references unknown node: {e.to}")
+    """Validate graph structure with enhanced error handling."""
+    with convert_exceptions("graph validation"):
+        node_ids = {n.id for n in graph.nodes}
+        if len(node_ids) != len(graph.nodes):
+            raise ValidationError("Duplicate node IDs detected in graph")
+        
+        for e in graph.edges:
+            if e.from_ not in node_ids:
+                raise ValidationError(f"Edge references unknown source node: {e.from_}")
+            if e.to not in node_ids:
+                raise ValidationError(f"Edge references unknown target node: {e.to}")
 
-    indeg = {n.id: 0 for n in graph.nodes}
-    children = {n.id: [] for n in graph.nodes}
-    for e in graph.edges:
-        indeg[e.to] += 1
-        children[e.from_].append(e.to)
+        indeg = {n.id: 0 for n in graph.nodes}
+        children = {n.id: [] for n in graph.nodes}
+        for e in graph.edges:
+            indeg[e.to] += 1
+            children[e.from_].append(e.to)
 
-    q = [nid for nid, d in indeg.items() if d == 0]
-    visited = 0
-    while q:
-        nid = q.pop()
-        visited += 1
-        for c in children[nid]:
-            indeg[c] -= 1
-            if indeg[c] == 0:
-                q.append(c)
-    
-    if visited != len(graph.nodes):
-        raise ValueError("Cycle detected in graph (DAG only)")
+        q = [nid for nid, d in indeg.items() if d == 0]
+        visited = 0
+        while q:
+            nid = q.pop()
+            visited += 1
+            for c in children[nid]:
+                indeg[c] -= 1
+                if indeg[c] == 0:
+                    q.append(c)
+        
+        if visited != len(graph.nodes):
+            raise ValidationError("Cycle detected in graph - only DAGs are supported")
     
 def _eval_cond(cond: dict, ctx: dict) -> bool:
     if not cond:

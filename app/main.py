@@ -1,6 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.responses import StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 import asyncio, uuid, time, logging, sys
 from typing import Dict, List
@@ -14,6 +15,24 @@ from app.core.middleware import (
     auth_handler,
     get_authenticated_user
 )
+from app.core.exceptions import (
+    WandException,
+    ResourceNotFoundError,
+    ValidationError,
+    ExecutionError,
+    ErrorResponse
+)
+from app.core.error_handlers import (
+    ExceptionHandlingMiddleware,
+    wand_exception_handler,
+    validation_exception_handler,
+    http_exception_handler,
+    generic_exception_handler,
+    raise_not_found,
+    raise_validation_error,
+    convert_exceptions
+)
+from app.core.validation import ValidatedGraphRequest, ValidatedRunRequest
 from app.core.registry import ToolRegistry, AgentRegistry
 from app.runtime.executor import Executor, GraphSpec, NodeSpec, EdgeSpec
 from app.storage import init_db, save_run, append_event, load_events
@@ -43,6 +62,7 @@ app = FastAPI(
         "- Pluggable Tools & Agents\n"
         "- SSE streaming and cancellation\n"
         "- Configuration-driven setup\n"
+        "- Enhanced error handling and validation\n"
         "- Authentication and rate limiting"
     ),
     contact={"name": "Maksim", "url": "https://github.com/mcnic"},
@@ -51,7 +71,14 @@ app = FastAPI(
     debug=config.debug
 )
 
+# Add exception handlers
+app.add_exception_handler(WandException, wand_exception_handler)
+app.add_exception_handler(RequestValidationError, validation_exception_handler)
+app.add_exception_handler(HTTPException, http_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
+
 # Add middleware in correct order (last added = first executed)
+app.add_middleware(ExceptionHandlingMiddleware)
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 app.add_middleware(RateLimitMiddleware)
@@ -68,16 +95,12 @@ app.add_middleware(
 def root():
     return RedirectResponse(url="/docs")
 
-class CreateGraphReq(BaseModel):
-    name: str
-    nodes: list[NodeSpec]
-    edges: list[EdgeSpec]
-    options: dict | None = None
-
+# In-memory storage (would be replaced with proper database in production)
 GRAPHS: dict[str, GraphSpec] = {}
 RUNS: dict[str, dict] = {}
 EVENTS: dict[str, list] = {}
 
+# Initialize components
 tool_registry = ToolRegistry()
 agent_registry = AgentRegistry()
 executor = Executor(tool_registry, agent_registry)
@@ -90,17 +113,7 @@ class RunCtrl:
 RUN_CTRLS: Dict[str, RunCtrl] = {}
 
 # ---------- API Schemas ----------
-class CreateGraphReq(BaseModel):
-    name: str = Field(..., example="demo")
-    nodes: List[NodeSpec]
-    edges: List[EdgeSpec]
-    options: dict | None = Field(default=None, example={"concurrency": 2, "default_timeout_sec": 10, "max_retries": 1})
-    sinks: List[str] = Field(default_factory=list)
-
 class CreateGraphResp(BaseModel):
-    graph_id: str = Field(..., example="g_ab12cd34")
-
-class CreateRunReq(BaseModel):
     graph_id: str = Field(..., example="g_ab12cd34")
 
 class CreateRunResp(BaseModel):
@@ -133,18 +146,22 @@ def health():
     tags=["graphs"],
     summary="Create (register) an execution graph"
 )
-def create_graph(req: CreateGraphReq, user=Depends(get_authenticated_user)):
-    """Create and register a new execution graph."""
-    gid = f"g_{uuid.uuid4().hex[:8]}"
-    spec = GraphSpec(
-        name=req.name, 
-        nodes=req.nodes, 
-        edges=req.edges, 
-        options=req.options or {}
-    )
-    GRAPHS[gid] = spec
-    logger.info(f"Graph created: {gid} - {req.name}")
-    return {"graph_id": gid}
+def create_graph(req: ValidatedGraphRequest, user=Depends(get_authenticated_user)):
+    """Create and register a new execution graph with enhanced validation."""
+    with convert_exceptions("graph creation"):
+        gid = f"g_{uuid.uuid4().hex[:8]}"
+        
+        # Convert validated request to GraphSpec
+        spec = GraphSpec(
+            name=req.name, 
+            nodes=[NodeSpec(**node) for node in req.nodes], 
+            edges=[EdgeSpec(**edge) for edge in req.edges], 
+            options=req.options or {}
+        )
+        
+        GRAPHS[gid] = spec
+        logger.info(f"Graph created: {gid} - {req.name}")
+        return {"graph_id": gid}
 
 class CreateRunReq(BaseModel):
     graph_id: str
@@ -156,38 +173,42 @@ class CreateRunReq(BaseModel):
     tags=["runs"],
     summary="Start a run for a given graph",
 )
-async def create_run(req: CreateRunReq, user=Depends(get_authenticated_user)):
-    """Start execution of a graph."""
-    if req.graph_id not in GRAPHS:
-        raise HTTPException(404, "graph not found")
-    rid = f"r_{uuid.uuid4().hex[:8]}"
-    RUNS[rid] = {"status": "PENDING", "result": None, "error": None}
-    EVENTS[rid] = []
-    logger.info(f"Run created: {rid} for graph={req.graph_id}")
-    RUN_CTRLS[rid] = RunCtrl()
-    await save_run(rid, GRAPHS[req.graph_id].name, "PENDING", None, None)
-    
-    # Add run_id to emit function for logging
-    async def emit_with_run_id(evt: dict):
-        await RUN_CTRLS[rid].queue.put(evt)
-        await append_event(rid, evt)
-    emit_with_run_id._run_id = rid
-    
-    asyncio.create_task(_run_background(rid, GRAPHS[req.graph_id], EVENTS[rid], RUN_CTRLS[rid], emit_with_run_id))
-    return {"run_id": rid}
+async def create_run(req: ValidatedRunRequest, user=Depends(get_authenticated_user)):
+    """Start execution of a graph with enhanced validation."""
+    with convert_exceptions("run creation"):
+        if req.graph_id not in GRAPHS:
+            raise_not_found("graph", req.graph_id)
+        
+        rid = f"r_{uuid.uuid4().hex[:8]}"
+        RUNS[rid] = {"status": "PENDING", "result": None, "error": None}
+        EVENTS[rid] = []
+        logger.info(f"Run created: {rid} for graph={req.graph_id}")
+        RUN_CTRLS[rid] = RunCtrl()
+        await save_run(rid, GRAPHS[req.graph_id].name, "PENDING", None, None)
+        
+        # Add run_id to emit function for logging
+        async def emit_with_run_id(evt: dict):
+            await RUN_CTRLS[rid].queue.put(evt)
+            await append_event(rid, evt)
+        emit_with_run_id._run_id = rid
+        
+        asyncio.create_task(_run_background(rid, GRAPHS[req.graph_id], EVENTS[rid], RUN_CTRLS[rid], emit_with_run_id))
+        return {"run_id": rid}
 
 async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: RunCtrl, on_event_func):
+    """Background task for executing graph runs with enhanced error handling."""
     logger.info(f"Run {run_id} started")
     RUNS[run_id]["status"] = "RUNNING"
     await save_run(run_id, graph.name, "RUNNING", None, None)
 
     try:
-        result = await executor.execute(
-            graph, 
-            events,
-            cancel_event=ctrl.cancel_event,
-            on_event=on_event_func
-        )
+        with convert_exceptions("graph execution"):
+            result = await executor.execute(
+                graph, 
+                events,
+                cancel_event=ctrl.cancel_event,
+                on_event=on_event_func
+            )
         RUNS[run_id]["status"] = "SUCCESS"
         RUNS[run_id]["result"] = result
         await save_run(run_id, graph.name, "SUCCESS", result, None)
@@ -199,6 +220,12 @@ async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: Run
         await save_run(run_id, graph.name, "CANCELLED", None, "cancelled")
         await ctrl.queue.put({"ts": time.time(), "lvl": "warn", "msg": "run.cancelled"})
         logger.warning(f"Run {run_id} was cancelled")
+    except WandException as e:
+        RUNS[run_id]["status"] = "FAILED"
+        RUNS[run_id]["error"] = e.message
+        await save_run(run_id, graph.name, "FAILED", None, e.message)
+        await ctrl.queue.put({"ts": time.time(), "lvl": "error", "msg": f"run.failed: {e.message}"})
+        logger.error(f"Run {run_id} failed: {e.message}")
     except Exception as e:
         RUNS[run_id]["status"] = "FAILED"
         RUNS[run_id]["error"] = str(e)
@@ -217,7 +244,7 @@ async def _run_background(run_id: str, graph: GraphSpec, events: list, ctrl: Run
 def get_run(run_id: str, user=Depends(get_authenticated_user)):
     """Get the current status and result of a run."""
     if run_id not in RUNS:
-        raise HTTPException(404, "run not found")
+        raise_not_found("run", run_id)
     return RUNS[run_id]
 
 @app.get(
@@ -229,14 +256,16 @@ def get_run(run_id: str, user=Depends(get_authenticated_user)):
 async def get_logs(run_id: str, user=Depends(get_authenticated_user)):
     """Get all logged events for a run."""
     if run_id not in EVENTS:
-        raise HTTPException(404, "run not found")
-    return await load_events(run_id)
+        raise_not_found("run", run_id)
+    
+    with convert_exceptions("log retrieval"):
+        return await load_events(run_id)
 
 @app.get("/runs/{run_id}/stream", tags=["runs"], summary="SSE stream of run events")
 async def stream(run_id: str, user=Depends(get_authenticated_user)):
     """Stream run events in real-time via Server-Sent Events."""
     if run_id not in RUN_CTRLS:
-        raise HTTPException(404, "run not found")
+        raise_not_found("run", run_id)
     
     async def event_gen():
         q = RUN_CTRLS[run_id].queue
@@ -258,7 +287,8 @@ async def stream(run_id: str, user=Depends(get_authenticated_user)):
 async def cancel_run(run_id: str, user=Depends(get_authenticated_user)):
     """Cancel an active run."""
     if run_id not in RUN_CTRLS:
-        raise HTTPException(404, "run not found")
+        raise_not_found("run", run_id)
+    
     RUN_CTRLS[run_id].cancel_event.set()
     logger.info(f"Run {run_id} cancellation requested")
     return {"ok": True, "message": f"Cancellation requested for run {run_id}"}
